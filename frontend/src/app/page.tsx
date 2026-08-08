@@ -217,9 +217,9 @@ export default function Home() {
   return (
     <>
       {/* Top Navbar */}
-      <header className="fixed top-0 left-0 w-full z-50 flex justify-between items-center px-gutter h-16 bg-white border-b border-outline-variant shadow-sm animate-fade-in">
+      <header className="fixed top-0 left-0 w-full z-50 flex justify-between items-center px-gutter h-20 bg-white border-b border-outline-variant shadow-sm animate-fade-in">
         <div className="flex items-center cursor-pointer" onClick={() => setCurrentTab('overview')}>
-          <img alt="Continuity Logo" className="h-11 md:h-12 w-auto max-h-none py-1" src="/image.png"/>
+          <img alt="Continuity Logo" className="h-14 md:h-16 w-auto max-h-none py-1.5 transition-transform hover:scale-102" src="/image.png"/>
         </div>
         <div className="flex items-center gap-stack-md hidden md:flex text-on-surface-variant font-semibold text-sm tracking-wide">
           <a className={getDesktopNavClass('overview')} onClick={() => setCurrentTab('overview')}>Overview</a>
@@ -247,7 +247,7 @@ export default function Home() {
       </header>
 
       {/* Main Containers */}
-      <main className="pt-24 px-margin-mobile md:px-margin-desktop max-w-container-max mx-auto space-y-stack-lg pb-12">
+      <main className="pt-28 px-margin-mobile md:px-margin-desktop max-w-container-max mx-auto space-y-stack-lg pb-12">
         {/* Dynamic Header */}
         {currentTab !== 'activity' && currentTab !== 'sandbox' && (
           <section className="mb-4">
