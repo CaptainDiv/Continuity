@@ -7,9 +7,22 @@ import {
   lightTheme,
 } from '@rainbow-me/rainbowkit';
 import { WagmiProvider } from 'wagmi';
-import { mainnet, sepolia, hardhat } from 'wagmi/chains';
+import { defineChain } from 'viem';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import '@rainbow-me/rainbowkit/styles.css';
+
+export const monadTestnet = defineChain({
+  id: 10143,
+  name: 'Monad Testnet',
+  nativeCurrency: { name: 'MON', symbol: 'MON', decimals: 18 },
+  rpcUrls: {
+    default: { http: ['https://testnet-rpc.monad.xyz'] },
+  },
+  blockExplorers: {
+    default: { name: 'MonadExplorer', url: 'https://testnet.monadexplorer.com' },
+  },
+  testnet: true,
+});
 
 const queryClient = new QueryClient();
 
@@ -17,7 +30,7 @@ const queryClient = new QueryClient();
 const config = getDefaultConfig({
   appName: 'Continuity',
   projectId: 'a29b4eaf189c4ad1b78297b830d1d69d',
-  chains: [mainnet, sepolia, hardhat],
+  chains: [monadTestnet],
   ssr: true,
 });
 

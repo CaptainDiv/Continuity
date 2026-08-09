@@ -2,7 +2,18 @@
 
 import { useState } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
-import { useAccount } from 'wagmi';
+import { useAccount, useReadContract, useWriteContract } from 'wagmi';
+import { parseEther, formatEther } from 'viem';
+import {
+  POLICY_MANAGER_ADDRESS,
+  INSURANCE_POOL_ADDRESS,
+  REFERENCE_LENDING_POOL_ADDRESS,
+  CVA_MOCK_TOKEN_ADDRESS,
+  POLICY_MANAGER_ABI,
+  INSURANCE_POOL_ABI,
+  REFERENCE_LENDING_POOL_ABI,
+  ERC20_ABI,
+} from './constants';
 
 export default function Home() {
   const { isConnected, address } = useAccount();
@@ -12,17 +23,17 @@ export default function Home() {
   // Activity Sub-tab: 'list' (Screen 5) or 'detail' (Screen 4)
   const [activitySubTab, setActivitySubTab] = useState<'list' | 'detail'>('list');
 
-  // Simulator / Mock State
+  // Simulator / Mock State (for simulator fallback)
   const [isCviVerified, setIsCviVerified] = useState<boolean>(true);
-  const [poolReserves, setPoolReserves] = useState<number>(250000);
-  const [outstandingCoverage, setOutstandingCoverage] = useState<number>(135000);
+  const [mockPoolReserves, setMockPoolReserves] = useState<number>(250000);
+  const [mockOutstandingCoverage, setMockOutstandingCoverage] = useState<number>(135000);
   const [policyStatus, setPolicyStatus] = useState<'ACTIVE' | 'TRIGGERED' | 'EXPIRED'>('ACTIVE');
 
   // Staking Positions
-  const [userDeposit, setUserDeposit] = useState<number>(12500);
-  const [userEarnings, setUserEarnings] = useState<number>(450);
-  const [userWithdrawable, setUserWithdrawable] = useState<number>(12950);
-  const [userShare, setUserShare] = useState<number>(5.00);
+  const [mockUserDeposit, setMockUserDeposit] = useState<number>(12500);
+  const [mockUserEarnings, setMockUserEarnings] = useState<number>(450);
+  const [mockUserWithdrawable, setMockUserWithdrawable] = useState<number>(12950);
+  const [mockUserShare, setMockUserShare] = useState<number>(5.00);
 
   // Modals
   const [protectModalOpen, setProtectModalOpen] = useState<boolean>(false);
@@ -34,9 +45,71 @@ export default function Home() {
   const [undActionType, setUndActionType] = useState<'deposit' | 'withdraw'>('deposit');
   const [inputUnderwriteAmount, setInputUnderwriteAmount] = useState<string>('');
 
-  // Dynamically computed metrics
+  // Web3 Reads
+  const { data: contractReserves } = useReadContract({
+    address: INSURANCE_POOL_ADDRESS,
+    abi: INSURANCE_POOL_ABI,
+    functionName: 'getReserves',
+    query: { refetchInterval: 5000 },
+  });
+
+  const { data: contractLiability } = useReadContract({
+    address: INSURANCE_POOL_ADDRESS,
+    abi: INSURANCE_POOL_ABI,
+    functionName: 'totalCommittedLiability',
+    query: { refetchInterval: 5000 },
+  });
+
+  const { data: contractSolvencyBps } = useReadContract({
+    address: INSURANCE_POOL_ADDRESS,
+    abi: INSURANCE_POOL_ABI,
+    functionName: 'getSolvencyRatio',
+    query: { refetchInterval: 5000 },
+  });
+
+  const { data: contractTotalShares } = useReadContract({
+    address: INSURANCE_POOL_ADDRESS,
+    abi: INSURANCE_POOL_ABI,
+    functionName: 'totalShares',
+    query: { refetchInterval: 5000 },
+  });
+
+  const { data: userPositionData } = useReadContract({
+    address: INSURANCE_POOL_ADDRESS,
+    abi: INSURANCE_POOL_ABI,
+    functionName: 'getPosition',
+    args: address ? [address] : undefined,
+    query: { enabled: !!address, refetchInterval: 5000 },
+  });
+
+  const sharesOwned = userPositionData ? (userPositionData as any).sharesOwned : BigInt(0);
+
+  const { data: previewWithdrawAmount } = useReadContract({
+    address: INSURANCE_POOL_ADDRESS,
+    abi: INSURANCE_POOL_ABI,
+    functionName: 'previewWithdraw',
+    args: sharesOwned > BigInt(0) ? [sharesOwned] : undefined,
+    query: { enabled: !!address && sharesOwned > BigInt(0), refetchInterval: 5000 },
+  });
+
+  // Dynamically computed metrics (with contract fallbacks)
+  const poolReserves = contractReserves ? parseFloat(formatEther(contractReserves as bigint)) : mockPoolReserves;
+  const outstandingCoverage = contractLiability ? parseFloat(formatEther(contractLiability as bigint)) : mockOutstandingCoverage;
   const availableCapital = poolReserves - outstandingCoverage;
-  const solvencyRatio = outstandingCoverage > 0 ? Math.round((poolReserves / outstandingCoverage) * 100) : 9999;
+
+  const solvencyRatio = contractSolvencyBps && (contractSolvencyBps as bigint) !== BigInt("115792089237316195423570985008687907853269984665640564039457584007913129639935") // type(uint256).max
+    ? Math.round(Number(contractSolvencyBps as bigint) / 100)
+    : (outstandingCoverage > 0 ? Math.round((poolReserves / outstandingCoverage) * 100) : 9999);
+
+  const userWithdrawable = previewWithdrawAmount ? parseFloat(formatEther(previewWithdrawAmount as bigint)) : mockUserWithdrawable;
+  const userShare = contractTotalShares && (contractTotalShares as bigint) > BigInt(0) && sharesOwned > BigInt(0)
+    ? (Number((sharesOwned * BigInt(10000)) / (contractTotalShares as bigint)) / 100)
+    : mockUserShare;
+
+  const userDeposit = sharesOwned > BigInt(0) ? userWithdrawable : mockUserDeposit;
+  const userEarnings = sharesOwned > BigInt(0) ? 0 : mockUserEarnings;
+
+  const { writeContractAsync } = useWriteContract();
 
   const calculatePremiumQuote = () => {
     return (inputCoverage * 2.5) / 100;
@@ -113,16 +186,45 @@ export default function Home() {
     setProtectModalOpen(true);
   };
 
-  const confirmProtection = () => {
+  const confirmProtection = async () => {
     const cover = inputCoverage;
     if (cover <= 0) return alert("Please enter a valid coverage amount.");
     if (cover > activeLoanBalance) return alert(`Coverage cannot exceed outstanding balance of ${formatUSD(activeLoanBalance)}.`);
 
-    setProtectModalOpen(false);
-    setOutstandingCoverage(prev => prev + cover);
-    setPolicyStatus('ACTIVE');
-    setCurrentTab('overview');
-    alert("Transaction complete: Policy purchased successfully!");
+    if (isConnected && address) {
+      try {
+        const coverWei = parseEther(cover.toString());
+        const premiumWei = (coverWei * BigInt(250)) / BigInt(10000); // 2.5% rate -> 250 bps
+        
+        // 1. Approve premium spend
+        await writeContractAsync({
+          address: CVA_MOCK_TOKEN_ADDRESS,
+          abi: ERC20_ABI,
+          functionName: 'approve',
+          args: [INSURANCE_POOL_ADDRESS, premiumWei],
+        });
+        
+        // 2. Transact buyPolicy
+        await writeContractAsync({
+          address: POLICY_MANAGER_ADDRESS,
+          abi: POLICY_MANAGER_ABI,
+          functionName: 'buyPolicy',
+          args: [REFERENCE_LENDING_POOL_ADDRESS, BigInt(activeLoanId || 104), coverWei],
+        });
+        
+        alert("Policy purchased successfully on Monad Testnet!");
+        setProtectModalOpen(false);
+      } catch (err: any) {
+        console.error(err);
+        alert(`Transaction failed: ${err.message || err}`);
+      }
+    } else {
+      setProtectModalOpen(false);
+      setMockOutstandingCoverage(prev => prev + cover);
+      setPolicyStatus('ACTIVE');
+      setCurrentTab('overview');
+      alert("Transaction complete: Local simulation policy purchased!");
+    }
   };
 
   const handleOpenUnderwriteAction = (type: 'deposit' | 'withdraw') => {
@@ -131,30 +233,76 @@ export default function Home() {
     setUnderwriteModalOpen(true);
   };
 
-  const submitUnderwriteAction = () => {
+  const submitUnderwriteAction = async () => {
     const amount = parseFloat(inputUnderwriteAmount) || 0;
     if (amount <= 0) return alert('Please enter a valid amount.');
 
-    if (undActionType === 'deposit') {
-      const nextReserves = poolReserves + amount;
-      const nextDeposit = userDeposit + amount;
-      setPoolReserves(nextReserves);
-      setUserDeposit(nextDeposit);
-      setUserWithdrawable(nextDeposit + userEarnings);
-      setUserShare((nextDeposit / nextReserves) * 100);
-    } else {
-      if (amount > userWithdrawable) return alert('Insufficient balance.');
-      if ((poolReserves - amount) < outstandingCoverage) {
-        return alert('Reverted: Solvency limit violated. You cannot unlock capital actively pledged to active policies.');
+    if (isConnected && address) {
+      try {
+        const amountWei = parseEther(amount.toString());
+        
+        if (undActionType === 'deposit') {
+          // Approve
+          await writeContractAsync({
+            address: CVA_MOCK_TOKEN_ADDRESS,
+            abi: ERC20_ABI,
+            functionName: 'approve',
+            args: [INSURANCE_POOL_ADDRESS, amountWei],
+          });
+          
+          // Deposit
+          await writeContractAsync({
+            address: INSURANCE_POOL_ADDRESS,
+            abi: INSURANCE_POOL_ABI,
+            functionName: 'depositUnderwriting',
+            args: [amountWei],
+          });
+          
+          alert("Capital deposited successfully on Monad Testnet!");
+        } else {
+          if (!contractReserves || !contractTotalShares) return;
+          const reserves = contractReserves as bigint;
+          const totalShares = contractTotalShares as bigint;
+          if (reserves === BigInt(0)) return;
+          
+          const sharesToWithdraw = (amountWei * totalShares) / reserves;
+          
+          await writeContractAsync({
+            address: INSURANCE_POOL_ADDRESS,
+            abi: INSURANCE_POOL_ABI,
+            functionName: 'withdrawUnderwriting',
+            args: [sharesToWithdraw],
+          });
+          
+          alert("Capital withdrawn successfully on Monad Testnet!");
+        }
+        setUnderwriteModalOpen(false);
+      } catch (err: any) {
+        console.error(err);
+        alert(`Transaction failed: ${err.message || err}`);
       }
-      const nextReserves = poolReserves - amount;
-      const nextDeposit = userDeposit - amount;
-      setPoolReserves(nextReserves);
-      setUserDeposit(nextDeposit);
-      setUserWithdrawable(nextDeposit + userEarnings);
-      setUserShare(nextReserves > 0 ? (nextDeposit / nextReserves) * 100 : 0);
+    } else {
+      if (undActionType === 'deposit') {
+        const nextReserves = poolReserves + amount;
+        const nextDeposit = userDeposit + amount;
+        setMockPoolReserves(nextReserves);
+        setMockUserDeposit(nextDeposit);
+        setMockUserWithdrawable(nextDeposit + userEarnings);
+        setMockUserShare((nextDeposit / nextReserves) * 100);
+      } else {
+        if (amount > userWithdrawable) return alert('Insufficient balance.');
+        if ((poolReserves - amount) < outstandingCoverage) {
+          return alert('Reverted: Solvency limit violated. You cannot unlock capital actively pledged to active policies.');
+        }
+        const nextReserves = poolReserves - amount;
+        const nextDeposit = userDeposit - amount;
+        setMockPoolReserves(nextReserves);
+        setMockUserDeposit(nextDeposit);
+        setMockUserWithdrawable(nextDeposit + userEarnings);
+        setMockUserShare(nextReserves > 0 ? (nextDeposit / nextReserves) * 100 : 0);
+      }
+      setUnderwriteModalOpen(false);
     }
-    setUnderwriteModalOpen(false);
   };
 
   // Sandbox Triggers
@@ -167,8 +315,8 @@ export default function Home() {
     if (isCviVerified) {
       return alert('Compliance Oracle Check: Payout cannot execute while Borrower CVI is still verified. Revoke Borrower credential in Sandbox first.');
     }
-    setPoolReserves(prev => prev - 20000);
-    setOutstandingCoverage(prev => prev - 20000);
+    setMockPoolReserves(prev => prev - 20000);
+    setMockOutstandingCoverage(prev => prev - 20000);
     setPolicyStatus('TRIGGERED');
     setCurrentTab('activity');
     setActivitySubTab('detail');
@@ -177,7 +325,7 @@ export default function Home() {
 
   const triggerExpirySim = () => {
     if (policyStatus !== 'ACTIVE') return alert('No active protection to expire.');
-    setOutstandingCoverage(prev => prev - 20000);
+    setMockOutstandingCoverage(prev => prev - 20000);
     setPolicyStatus('EXPIRED');
     setCurrentTab('overview');
     alert("Loan fully repaid. Policy expired and locked capital released back to underwriters.");
@@ -217,9 +365,10 @@ export default function Home() {
   return (
     <>
       {/* Top Navbar */}
-      <header className="fixed top-0 left-0 w-full z-50 flex justify-between items-center px-gutter h-16 bg-white border-b border-outline-variant shadow-sm animate-fade-in">
-        <div className="flex items-center cursor-pointer" onClick={() => setCurrentTab('overview')}>
-          <img alt="Continuity Logo" className="h-11 md:h-12 w-auto max-h-none py-1" src="/image.png"/>
+      <header className="fixed top-0 left-0 w-full z-50 flex justify-between items-center px-gutter h-20 bg-white border-b border-outline-variant shadow-sm animate-fade-in">
+        <div className="flex items-center gap-2 cursor-pointer select-none" onClick={() => setCurrentTab('overview')}>
+          <span className="material-symbols-outlined text-primary-dark text-3xl font-extrabold rotate-[-45deg] scale-110">link</span>
+          <span className="text-2xl font-black text-primary-dark tracking-tight">Continuity</span>
         </div>
         <div className="flex items-center gap-stack-md hidden md:flex text-on-surface-variant font-semibold text-sm tracking-wide">
           <a className={getDesktopNavClass('overview')} onClick={() => setCurrentTab('overview')}>Overview</a>
@@ -247,7 +396,7 @@ export default function Home() {
       </header>
 
       {/* Main Containers */}
-      <main className="pt-24 px-margin-mobile md:px-margin-desktop max-w-container-max mx-auto space-y-stack-lg pb-12">
+      <main className="pt-28 px-margin-mobile md:px-margin-desktop max-w-container-max mx-auto space-y-stack-lg pb-12">
         {/* Dynamic Header */}
         {currentTab !== 'activity' && currentTab !== 'sandbox' && (
           <section className="mb-4">
