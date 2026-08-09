@@ -25,7 +25,7 @@ contract MockCCP is ICCP {
 contract DeployScript is Script {
     function run() external {
         vm.startBroadcast();
-        
+
         // 1. Deploy infrastructure
         MockERC20 cvaToken = new MockERC20();
         MockCCP ccp = new MockCCP();
@@ -39,7 +39,7 @@ contract DeployScript is Script {
             address(cvaToken),
             address(ccp),
             msg.sender, // Sets your deployer wallet as the authorized relayer
-            1 days, 
+            0, // Changed from 1 days to 0 for instant testing
             8000,   
             500     
         );

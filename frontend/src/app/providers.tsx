@@ -7,17 +7,30 @@ import {
   lightTheme,
 } from '@rainbow-me/rainbowkit';
 import { WagmiProvider } from 'wagmi';
-import { mainnet, sepolia, hardhat } from 'wagmi/chains';
+import { type Chain } from 'viem';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import '@rainbow-me/rainbowkit/styles.css';
 
+// Define Monad Testnet Chain
+export const monadTestnet: Chain = {
+  id: 10143,
+  name: 'Monad Testnet',
+  nativeCurrency: { name: 'Monad', symbol: 'MON', decimals: 18 },
+  rpcUrls: {
+    default: { http: ['https://testnet-rpc.monad.xyz'] },
+  },
+  blockExplorers: {
+    default: { name: 'Monad Vision', url: 'https://testnet.monadvision.com' },
+  },
+  testnet: true,
+};
+
 const queryClient = new QueryClient();
 
-// Use a mock walletconnect project ID for demo purposes
 const config = getDefaultConfig({
   appName: 'Continuity',
   projectId: 'a29b4eaf189c4ad1b78297b830d1d69d',
-  chains: [mainnet, sepolia, hardhat],
+  chains: [monadTestnet],
   ssr: true,
 });
 

@@ -1,11 +1,242 @@
 'use client';
 
-import { useState } from 'react';
+import { FaucetButton } from "./FaucetButton";
+import { useEffect, useMemo, useState } from 'react';
 import { ConnectButton } from '@rainbow-me/rainbowkit';
-import { useAccount } from 'wagmi';
+import {
+  useAccount,
+  useSimulateContract,
+  useWaitForTransactionReceipt,
+  useWriteContract,
+} from 'wagmi';
+import { BaseError, ContractFunctionRevertedError, decodeEventLog, type Abi } from 'viem';
+import { CONTRACT_ADDRESSES, CONTRACT_ABIS } from './contracts';
+
+// Etherscan-style Monad testnet explorer (per docs.monad.xyz/tooling-and-infra/block-explorers).
+// Swap this if your team is using a different explorer.
+const EXPLORER_TX_BASE = "https://testnet.monadscan.com/tx";
+
+const truncateHash = (hash: string, start = 6, end = 4) => `${hash.slice(0, start)}...${hash.slice(-end)}`;
+
+// Best-effort extraction of a newly-minted policy ID from a transaction
+// receipt's logs. We don't hardcode an event name/signature here because the
+// PolicyManager ABI is imported from JSON and its exact event shape can
+// change between deployments — instead we decode every log with the known
+// ABI and pick the first arg whose key looks like "policyId". If nothing
+// decodes (e.g. the event uses a different arg name entirely), the caller
+// falls back to the simulated return value, and ultimately to letting the
+// judge enter the ID manually.
+function extractPolicyIdFromLogs(
+  logs: readonly { data: `0x${string}`; topics: readonly `0x${string}`[] }[],
+  abi: Abi,
+): bigint | undefined {
+  for (const log of logs) {
+    try {
+      const decoded = decodeEventLog({ abi, data: log.data, topics: log.topics as any });
+      const args = decoded.args as unknown;
+      if (args && typeof args === 'object' && !Array.isArray(args)) {
+        for (const [key, value] of Object.entries(args as Record<string, unknown>)) {
+          if (/policyid/i.test(key) && (typeof value === 'bigint' || typeof value === 'number')) {
+            return typeof value === 'bigint' ? value : BigInt(value);
+          }
+        }
+      }
+    } catch {
+      // Not decodable against this ABI / unrelated log — expected for most
+      // entries in a receipt (e.g. ERC20 Transfer logs from premium pull).
+      continue;
+    }
+  }
+  return undefined;
+}
 
 export default function Home() {
   const { isConnected, address } = useAccount();
+
+  // ---------------------------------------------------------------------
+  // REAL ON-CHAIN JUDGE DEMO PIPELINE
+  // ---------------------------------------------------------------------
+  // Three steps, each gated on a real mined receipt (never on broadcast
+  // alone — see the note further down on why that distinction matters):
+  //
+  //   Step 1  Mint       buyPolicy(referenceLendingPool, loanId=0, coverage=10)
+  //   Step 2  Trigger    checkAndTrigger(policyId)     — simulated first
+  //   Step 3  Success    explorer links for both transactions
+  //
+  // Step 1's confirmed Policy ID is threaded automatically into Step 2, so
+  // a judge never has to guess or type an ID. A manual override is still
+  // available (collapsed by default) in case someone wants to re-trigger
+  // an existing policy from a previous run.
+
+  const [policyIdInput, setPolicyIdInput] = useState<string>('');
+  const [mintedPolicyId, setMintedPolicyId] = useState<bigint | undefined>(undefined);
+  const [pipelineStep, setPipelineStep] = useState<1 | 2 | 3>(1);
+  const [showManualPolicyId, setShowManualPolicyId] = useState<boolean>(false);
+
+  const policyId = useMemo<bigint | undefined>(() => {
+    try {
+      if (policyIdInput.trim() === '') return undefined;
+      const id = BigInt(policyIdInput);
+      return id >= BigInt(0) ? id : undefined;
+    } catch {
+      return undefined;
+    }
+  }, [policyIdInput]);
+
+  // Hardcoded for the demo per the hackathon brief: a fresh policy against
+  // the reference lending pool, loan #0, 10 units of coverage.
+  const MINT_ARGS = {
+    loanContract: CONTRACT_ADDRESSES.referenceLendingPool,
+    loanId: BigInt(0),
+    coverageAmount: BigInt(10),
+  } as const;
+
+  // --- Step 1: Mint -------------------------------------------------
+  const {
+    data: mintSimulation,
+    error: mintSimulateError,
+    isLoading: isMintSimulating,
+  } = useSimulateContract({
+    address: CONTRACT_ADDRESSES.policyManager,
+    abi: CONTRACT_ABIS.policyManager,
+    functionName: 'buyPolicy',
+    args: [MINT_ARGS.loanContract, MINT_ARGS.loanId, MINT_ARGS.coverageAmount],
+    query: {
+      // Once we have a minted policy for this session there's no need to
+      // keep re-simulating a fresh mint in the background.
+      enabled: isConnected && mintedPolicyId === undefined,
+    },
+  });
+
+  const {
+    writeContract: writeMint,
+    data: mintHash,
+    isPending: isMintPending,
+    error: mintWriteError,
+    reset: resetMintWrite,
+  } = useWriteContract();
+
+  const {
+    data: mintReceipt,
+    isLoading: isMintConfirming,
+  } = useWaitForTransactionReceipt({ hash: mintHash });
+
+  // Snapshotted the moment the judge clicks "Mint Policy", not re-read later —
+  // useSimulateContract can quietly refetch in the background while the tx is
+  // pending, and by confirmation time it may reflect the *next* policy slot
+  // rather than the one this tx actually minted.
+  const [pendingMintResultId, setPendingMintResultId] = useState<bigint | undefined>(undefined);
+
+  const handleMintPolicy = () => {
+    if (!mintSimulation?.request) return; // button is disabled in this case anyway
+    const simResult = mintSimulation.result;
+    setPendingMintResultId(typeof simResult === 'bigint' ? simResult : undefined);
+    writeMint(mintSimulation.request);
+  };
+
+  // --- Step 2: Trigger ------------------------------------------------
+  // Preflight — a read-only simulation of checkAndTrigger. If this fails,
+  // we know the real tx would revert (and with what error) before the
+  // user ever opens their wallet.
+  const {
+    data: simulation,
+    error: simulateError,
+    isLoading: isSimulating,
+  } = useSimulateContract({
+    address: CONTRACT_ADDRESSES.policyManager,
+    abi: CONTRACT_ABIS.policyManager,
+    functionName: 'checkAndTrigger',
+    args: policyId !== undefined ? [policyId] : undefined,
+    query: {
+      enabled: isConnected && policyId !== undefined,
+    },
+  });
+
+  const {
+    writeContract: writeTrigger,
+    data: triggerHash,
+    isPending: isTriggerPending,
+    error: triggerWriteError,
+    reset: resetTriggerWrite,
+  } = useWriteContract();
+
+  // Confirmation — this is the piece that was missing in the original
+  // build. isSuccess here reflects the *mined receipt*, not the broadcast.
+  const {
+    data: triggerReceipt,
+    isLoading: isTriggerConfirming,
+  } = useWaitForTransactionReceipt({ hash: triggerHash });
+
+  const handleTriggerPayout = () => {
+    if (!simulation?.request) return; // button is disabled in this case anyway
+    writeTrigger(simulation.request);
+  };
+
+  function describeContractError(err: unknown, idForMessage: string): string {
+    if (!err) return '';
+    if (err instanceof BaseError) {
+      const revert = err.walk((e) => e instanceof ContractFunctionRevertedError);
+      if (revert instanceof ContractFunctionRevertedError) {
+        const name = revert.data?.errorName;
+        if (name === 'PolicyNotFound') {
+          return `Policy #${idForMessage} doesn't exist on this deployment yet.`;
+        }
+        if (name === 'PolicyNotActive') {
+          return `Policy #${idForMessage} exists but isn't Active (already triggered, expired, or never activated).`;
+        }
+        if (name === 'PolicyNotYetActive') {
+          return `Policy #${idForMessage} is still inside its waiting period.`;
+        }
+        if (name) return `Reverted: ${name}`;
+        return revert.shortMessage;
+      }
+      return err.shortMessage ?? err.message;
+    }
+    return (err as Error)?.message ?? 'Unknown error';
+  }
+
+  // When Step 1's mint is CONFIRMED (not just broadcast), resolve the new
+  // policy ID and advance the pipeline automatically.
+  useEffect(() => {
+    if (!mintReceipt || !mintHash) return;
+    if (mintReceipt.status !== 'success') return;
+
+    const decodedId = extractPolicyIdFromLogs(mintReceipt.logs, CONTRACT_ABIS.policyManager as Abi);
+    const resolvedId = decodedId ?? pendingMintResultId;
+
+    if (resolvedId !== undefined) {
+      setMintedPolicyId(resolvedId);
+      setPolicyIdInput(resolvedId.toString());
+    } else {
+      // Minted fine, but we couldn't confidently parse the ID out of the
+      // receipt or the simulated return value — hand control to the judge
+      // rather than guessing.
+      setShowManualPolicyId(true);
+    }
+    setPipelineStep(2);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [mintReceipt, mintHash]);
+
+  // When Step 2's trigger is CONFIRMED, advance to the success step and
+  // (separately, below) log it to the Activity Feed.
+  useEffect(() => {
+    if (!triggerReceipt || !triggerHash) return;
+    if (triggerReceipt.status === 'success') {
+      setPipelineStep(3);
+    }
+    // status === 'reverted' is surfaced directly in the Step 2 card instead.
+  }, [triggerReceipt, triggerHash]);
+
+  const handleResetDemo = () => {
+    setMintedPolicyId(undefined);
+    setPolicyIdInput('');
+    setShowManualPolicyId(false);
+    setPendingMintResultId(undefined);
+    setPipelineStep(1);
+    resetMintWrite();
+    resetTriggerWrite();
+  };
+  // ---------------------------------------------------------------------
 
   // Tab State
   const [currentTab, setCurrentTab] = useState<'overview' | 'protection' | 'underwriting' | 'activity' | 'sandbox'>('overview');
@@ -13,6 +244,11 @@ export default function Home() {
   const [activitySubTab, setActivitySubTab] = useState<'list' | 'detail'>('list');
 
   // Simulator / Mock State
+  // NOTE: everything below (pool reserves, coverage, staking positions, the
+  // Overview/Protection/Underwriting tabs) is illustrative local demo state,
+  // not read from the chain. It isn't part of the real on-chain pipeline, so
+  // it's left as-is. The Sandbox tab's pipeline card above is the only part
+  // of this file that talks to the real contracts.
   const [isCviVerified, setIsCviVerified] = useState<boolean>(true);
   const [poolReserves, setPoolReserves] = useState<number>(250000);
   const [outstandingCoverage, setOutstandingCoverage] = useState<number>(135000);
@@ -51,8 +287,8 @@ export default function Home() {
     return new Intl.NumberFormat('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 }).format(val);
   };
 
-  // Static Mock Audit Logs (Screen 5)
-  const mockAuditLogs = [
+  // Static Mock Audit Logs (Screen 5) — seeds the activity feed state below
+  const initialActivityLogs = [
     {
       time: "2023-10-27 14:32:01",
       title: "Policy #104 purchased",
@@ -104,6 +340,40 @@ export default function Home() {
       type: "payout"
     }
   ];
+
+  const [activityLogs, setActivityLogs] = useState(initialActivityLogs);
+
+  // When the real on-chain checkAndTrigger call is CONFIRMED (not just
+  // broadcast), prepend a live entry to the feed. Gated on the mined
+  // receipt's status, so a reverted transaction never reaches here.
+  useEffect(() => {
+    if (!triggerReceipt || !triggerHash) return;
+
+    if (triggerReceipt.status === 'success') {
+      const timestamp = new Date().toISOString().slice(0, 19).replace('T', ' ');
+      const newEntry = {
+        time: timestamp,
+        title: `Payout triggered on-chain for Policy #${policyIdInput} (checkAndTrigger)`,
+        icon: 'notifications_active',
+        iconColor: 'text-purple-700',
+        addr1: 'PolicyManager',
+        addr2: truncateHash(triggerHash),
+        amount: null,
+        type: 'trigger'
+      };
+      setActivityLogs(prev => [newEntry, ...prev]);
+      // These three lines still drive the local demo numbers behind the
+      // Overview/Protection mock cards. Swap for real useReadContract calls
+      // against insurancePool/policyManager once you're ready to wire the
+      // rest of the dashboard to live state.
+      setPoolReserves(prev => prev - 20000);
+      setOutstandingCoverage(prev => prev - 20000);
+      setPolicyStatus('TRIGGERED');
+    }
+    // status === 'reverted' is surfaced directly in the Sandbox card instead
+    // of being folded into this feed / mock-state update.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [triggerReceipt, triggerHash]);
 
   // Actions
   const handleOpenProtectModal = (loanId: number, balance: number) => {
@@ -162,19 +432,6 @@ export default function Home() {
     setIsCviVerified(prev => !prev);
   };
 
-  const triggerPayoutSim = () => {
-    if (policyStatus !== 'ACTIVE') return alert('No active protection to payout.');
-    if (isCviVerified) {
-      return alert('Compliance Oracle Check: Payout cannot execute while Borrower CVI is still verified. Revoke Borrower credential in Sandbox first.');
-    }
-    setPoolReserves(prev => prev - 20000);
-    setOutstandingCoverage(prev => prev - 20000);
-    setPolicyStatus('TRIGGERED');
-    setCurrentTab('activity');
-    setActivitySubTab('detail');
-    alert("Claim paid out successfully! $20,000 sent to Lender. Pool acquires subrogated debt claim.");
-  };
-
   const triggerExpirySim = () => {
     if (policyStatus !== 'ACTIVE') return alert('No active protection to expire.');
     setOutstandingCoverage(prev => prev - 20000);
@@ -214,6 +471,11 @@ export default function Home() {
     heroSubtitle = "Provide liquidity to underwrite compliance-event risk and earn premium yields.";
   }
 
+  // Pipeline step-dot state, used by the small stepper header in the
+  // Sandbox tab below.
+  const isStep1Complete = mintedPolicyId !== undefined || (showManualPolicyId && policyId !== undefined && pipelineStep > 1);
+  const isStep2Complete = triggerReceipt?.status === 'success';
+
   return (
     <>
       {/* Top Navbar */}
@@ -231,7 +493,12 @@ export default function Home() {
           </a>
         </div>
         <div className="flex items-center gap-stack-sm scale-90 md:scale-100">
+          <div className="hidden sm:flex items-center gap-1.5 bg-purple-50 text-purple-700 px-2.5 py-1 rounded-full border border-purple-200">
+            <div className="w-1.5 h-1.5 rounded-full bg-purple-600"></div>
+            <span className="text-[10px] font-bold uppercase tracking-wider">Monad Testnet</span>
+          </div>
           <ConnectButton showBalance={false} />
+          <FaucetButton />
           {isCviVerified ? (
             <div className="flex items-center gap-1 bg-[#E8F5E9] text-[#2E7D32] px-2.5 py-1 rounded-full border border-[#C8E6C9]">
               <div className="w-1.5 h-1.5 rounded-full bg-[#2E7D32] animate-pulse"></div>
@@ -311,7 +578,7 @@ export default function Home() {
                       <span className="text-[11px] uppercase text-outline font-bold tracking-wide block">Current Status</span>
                       {isCviVerified ? (
                         <span className="text-sm font-semibold text-primary-dark flex items-center gap-1">
-                          <span className="material-symbols-outlined text-sm text-[#2E7D32] animate-spin">radar</span>
+                          <span className="h-2 w-2 rounded-full bg-emerald-500 animate-pulse inline-block mr-2"></span>
                           Active Monitoring
                         </span>
                       ) : (
@@ -329,7 +596,7 @@ export default function Home() {
                 <h2 className="text-xl font-bold text-primary-dark pb-1">Featured Policy</h2>
                 <div className="glass-card rounded-xl overflow-hidden shadow-sm">
                   <div className="bg-surface-container-low px-4 py-3 border-b border-outline-variant flex justify-between items-center">
-                    <span className="text-sm font-bold text-primary-dark">Policy #0042</span>
+                    <span className="text-sm font-bold text-primary-dark">Policy #0042 (demo)</span>
                     {policyStatus === 'ACTIVE' ? (
                       <span className="text-xs font-bold text-[#2E7D32] bg-[#E8F5E9] px-2 py-0.5 rounded border border-[#C8E6C9]">ACTIVE</span>
                     ) : policyStatus === 'TRIGGERED' ? (
@@ -572,7 +839,7 @@ export default function Home() {
                 </div>
 
                 <div className="grid grid-cols-1 gap-3.5">
-                  {mockAuditLogs.map((log, idx) => (
+                  {activityLogs.map((log, idx) => (
                     <div
                       key={idx}
                       onClick={() => {
@@ -755,60 +1022,343 @@ export default function Home() {
           </div>
         )}
 
-        {/* Tab 5: Sandbox (demo triggers) */}
+        {/* Tab 5: Sandbox — Judge Demo Pipeline */}
         {currentTab === 'sandbox' && (
-          <div className="bg-purple-50 border border-purple-200 rounded-xl p-5 shadow-sm space-y-4 animate-fade-in select-none">
-            <div className="flex items-center gap-2 text-purple-800 font-bold text-lg">
-              <span className="material-symbols-outlined text-purple-750">science</span>
-              <span>Hackathon Simulator & Admin Engine</span>
+          <div className="space-y-6 animate-fade-in select-none">
+            {/* Header */}
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <div className="flex items-center gap-2 text-purple-800 font-bold text-lg">
+                  <span className="material-symbols-outlined text-purple-700">science</span>
+                  <span>Judge Demo Pipeline</span>
+                </div>
+                <p className="text-purple-700/80 text-sm font-medium mt-1 max-w-xl">
+                  Three real on-chain steps, run in order: mint a policy, run a preflight check and trigger its payout, then confirm on the explorer.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={handleResetDemo}
+                className="shrink-0 flex items-center gap-1.5 text-xs font-bold text-purple-700 bg-white border border-purple-200 hover:bg-purple-50 px-3 py-2 rounded-lg shadow-sm transition-colors cursor-pointer"
+              >
+                <span className="material-symbols-outlined text-sm">restart_alt</span>
+                Reset Demo
+              </button>
             </div>
-            <p className="text-purple-700 text-sm font-medium">Use this dashboard to run mock simulations. Switch compliance states or simulate a borrower default/recovery to test on-chain logic visual effects.</p>
 
-            <div className="grid grid-cols-1 md:grid-cols-2 gap-6 pt-2">
-              <div className="bg-white p-4 rounded-lg border border-purple-100 space-y-4">
-                <h3 className="font-bold text-primary-dark text-sm">1. CVI Identity Oracle simulation</h3>
-                <div className="flex items-center justify-between">
-                  <div>
-                    <span className="text-xs text-tertiary-dark uppercase font-semibold">Borrower Wallet (0x82...A91)</span>
-                    <div className="flex items-center gap-1 mt-1">
-                      {isCviVerified ? (
+            {/* Stepper */}
+            <div className="bg-white border border-purple-100 rounded-2xl shadow-sm px-6 py-5 max-w-xl mx-auto">
+              <div className="flex items-center">
+                <StepDot
+                  step={1}
+                  label="Mint Policy"
+                  isActive={pipelineStep === 1}
+                  isComplete={isStep1Complete}
+                  isUnlocked={true}
+                  onClick={() => setPipelineStep(1)}
+                />
+                <div className={`flex-1 h-[2px] mx-2 rounded-full transition-colors duration-300 ${isStep1Complete ? 'bg-[#2E7D32]' : 'bg-slate-200'}`} />
+                <StepDot
+                  step={2}
+                  label="Trigger Payout"
+                  isActive={pipelineStep === 2}
+                  isComplete={isStep2Complete}
+                  isUnlocked={isStep1Complete}
+                  onClick={() => isStep1Complete && setPipelineStep(2)}
+                />
+                <div className={`flex-1 h-[2px] mx-2 rounded-full transition-colors duration-300 ${isStep2Complete ? 'bg-[#2E7D32]' : 'bg-slate-200'}`} />
+                <StepDot
+                  step={3}
+                  label="Success"
+                  isActive={pipelineStep === 3}
+                  isComplete={isStep2Complete}
+                  isUnlocked={isStep2Complete}
+                  onClick={() => isStep2Complete && setPipelineStep(3)}
+                />
+              </div>
+            </div>
+
+            {/* Active step card */}
+            <div className="max-w-xl mx-auto">
+              {pipelineStep === 1 && (
+                <div className="bg-white rounded-2xl border border-purple-100 shadow-sm p-6 space-y-5 animate-fade-in">
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <span className="text-xs font-bold uppercase tracking-wider text-purple-600">Step 1 of 3</span>
+                      <h3 className="text-lg font-bold text-primary-dark mt-1">Initialize a Policy</h3>
+                      <p className="text-sm text-tertiary-dark mt-1">
+                        Mints a fresh parametric policy against the reference lending pool so there's a live Policy ID to trigger in Step 2.
+                      </p>
+                    </div>
+                    <div className="shrink-0 p-2.5 bg-purple-50 border border-purple-100 rounded-full text-purple-600">
+                      <span className="material-symbols-outlined text-xl">bolt</span>
+                    </div>
+                  </div>
+
+                  <div className="bg-surface-container-low border border-outline-variant rounded-xl p-4 space-y-2.5 text-xs">
+                    <div className="flex justify-between">
+                      <span className="text-tertiary-dark font-semibold">Reference Lending Pool</span>
+                      <span className="font-mono font-semibold text-primary-dark">{truncateHash(CONTRACT_ADDRESSES.referenceLendingPool)}</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-tertiary-dark font-semibold">Loan ID</span>
+                      <span className="font-mono font-semibold text-primary-dark">0</span>
+                    </div>
+                    <div className="flex justify-between">
+                      <span className="text-tertiary-dark font-semibold">Coverage Amount</span>
+                      <span className="font-mono font-semibold text-primary-dark">10 CVA</span>
+                    </div>
+                  </div>
+
+                  <p className="text-[11px] text-slate-400 italic leading-relaxed">
+                    Under the hood: PolicyManager checks CVA reserve solvency against InsurancePool, verifies the reference loan, and writes a new Policy record on-chain.
+                  </p>
+
+                  {!isConnected ? (
+                    <p className="text-xs text-slate-400">Connect your wallet to mint a policy.</p>
+                  ) : isMintSimulating ? (
+                    <p className="text-xs text-slate-500 flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-sm animate-spin">progress_activity</span>
+                      Running preflight check…
+                    </p>
+                  ) : mintSimulateError ? (
+                    <p className="text-xs text-red-600 font-semibold">
+                      Would revert: {describeContractError(mintSimulateError, '—')}
+                    </p>
+                  ) : mintSimulation ? (
+                    <p className="text-xs text-[#2E7D32] font-semibold flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-sm">check_circle</span>
+                      Ready to mint.
+                    </p>
+                  ) : null}
+
+                  <button
+                    disabled={!mintSimulation?.request || isMintPending || isMintConfirming}
+                    onClick={handleMintPolicy}
+                    className={mintSimulation?.request && !isMintPending && !isMintConfirming
+                      ? "w-full bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-700 hover:to-indigo-700 text-white font-bold text-sm py-3 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-all duration-300 cursor-pointer"
+                      : "w-full bg-slate-200 text-slate-400 font-bold text-sm py-3 rounded-xl cursor-not-allowed flex items-center justify-center gap-2"}
+                  >
+                    <span className={`material-symbols-outlined text-base ${isMintPending || isMintConfirming ? 'animate-spin' : ''}`}>
+                      {isMintPending || isMintConfirming ? 'progress_activity' : 'add_circle'}
+                    </span>
+                    {isMintPending ? 'Confirm in wallet…' : isMintConfirming ? 'Minting on-chain…' : 'Mint Policy'}
+                  </button>
+
+                  {mintWriteError && (
+                    <p className="text-[11px] text-red-600 font-semibold text-center">
+                      Wallet error: {describeContractError(mintWriteError, '—')}
+                    </p>
+                  )}
+                </div>
+              )}
+
+              {pipelineStep === 2 && (
+                <div className="bg-white rounded-2xl border border-purple-100 shadow-sm p-6 space-y-5 animate-fade-in">
+                  <div className="flex items-start justify-between gap-4">
+                    <div>
+                      <span className="text-xs font-bold uppercase tracking-wider text-purple-600">Step 2 of 3</span>
+                      <h3 className="text-lg font-bold text-primary-dark mt-1">Preflight &amp; Trigger</h3>
+                      <p className="text-sm text-tertiary-dark mt-1">
+                        Simulates checkAndTrigger before ever prompting a signature, then submits and waits for the mined receipt.
+                      </p>
+                    </div>
+                    <div className="shrink-0 p-2.5 bg-purple-50 border border-purple-100 rounded-full text-purple-600">
+                      <span className="material-symbols-outlined text-xl">radar</span>
+                    </div>
+                  </div>
+
+                  <div className="flex items-center justify-between bg-surface-container-low border border-outline-variant rounded-xl p-3.5">
+                    <div>
+                      <span className="text-[10px] uppercase text-tertiary-dark font-bold tracking-wide block">Policy ID</span>
+                      <span className="text-lg font-mono font-bold text-primary-dark">
+                        {policyIdInput ? `#${policyIdInput}` : '—'}
+                      </span>
+                      {mintedPolicyId !== undefined && (
+                        <span className="text-[10px] text-[#2E7D32] font-semibold flex items-center gap-1 mt-0.5">
+                          <span className="material-symbols-outlined text-[13px]">auto_awesome</span>
+                          Auto-filled from Step 1
+                        </span>
+                      )}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setShowManualPolicyId((v) => !v)}
+                      className="text-[11px] font-bold text-purple-600 hover:text-purple-800 underline underline-offset-2"
+                    >
+                      {showManualPolicyId ? 'Hide override' : 'Override ID'}
+                    </button>
+                  </div>
+
+                  {showManualPolicyId && (
+                    <div>
+                      <label className="block text-xs uppercase text-tertiary-dark font-bold mb-1">Manual Policy ID</label>
+                      <input
+                        type="number"
+                        min={0}
+                        value={policyIdInput}
+                        onChange={(e) => setPolicyIdInput(e.target.value)}
+                        className="w-full rounded-lg border border-outline p-2 font-mono text-sm focus:border-purple-500 focus:ring-1 focus:ring-purple-500 focus:outline-none"
+                        placeholder="e.g. 0"
+                      />
+                      {mintReceipt?.status === 'success' && mintedPolicyId === undefined && (
+                        <p className="text-[10px] text-amber-600 mt-1">
+                          Policy minted, but the ID couldn't be auto-detected from the transaction logs — enter it manually (check the mint transaction on the explorer if unsure).
+                        </p>
+                      )}
+                    </div>
+                  )}
+
+                  <p className="text-[11px] text-slate-400 italic leading-relaxed">
+                    Under the hood: verifying CVI identity on the borrower and checking CVA token reserves before authorizing the payout resolution.
+                  </p>
+
+                  {!isConnected ? (
+                    <p className="text-xs text-slate-400">Connect your wallet to check this policy.</p>
+                  ) : policyId === undefined ? (
+                    <p className="text-xs text-slate-400">Enter a valid policy ID to check it.</p>
+                  ) : isSimulating ? (
+                    <p className="text-xs text-slate-500 flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-sm animate-spin">progress_activity</span>
+                      Checking policy #{policyIdInput} on-chain…
+                    </p>
+                  ) : simulateError ? (
+                    <p className="text-xs text-red-600 font-semibold">
+                      Would revert: {describeContractError(simulateError, policyIdInput)}
+                    </p>
+                  ) : simulation ? (
+                    <p className="text-xs text-[#2E7D32] font-semibold flex items-center gap-1.5">
+                      <span className="material-symbols-outlined text-sm">check_circle</span>
+                      Policy #{policyIdInput} is triggerable right now.
+                    </p>
+                  ) : null}
+
+                  <button
+                    disabled={!simulation?.request || isTriggerPending || isTriggerConfirming}
+                    onClick={handleTriggerPayout}
+                    className={simulation?.request && !isTriggerPending && !isTriggerConfirming
+                      ? "w-full bg-red-600 hover:bg-red-700 text-white font-bold text-sm py-3 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-all duration-300 cursor-pointer"
+                      : "w-full bg-slate-200 text-slate-400 font-bold text-sm py-3 rounded-xl cursor-not-allowed flex items-center justify-center gap-2"}
+                  >
+                    <span className={`material-symbols-outlined text-base ${isTriggerPending || isTriggerConfirming ? 'animate-spin' : ''}`}>
+                      {isTriggerPending || isTriggerConfirming ? 'progress_activity' : 'notifications_active'}
+                    </span>
+                    {isTriggerPending ? 'Confirm in wallet…' : isTriggerConfirming ? 'Waiting for confirmation…' : `Trigger Oracle Payout (Policy #${policyIdInput || '—'})`}
+                  </button>
+
+                  {triggerWriteError && (
+                    <p className="text-[11px] text-red-600 font-semibold text-center">
+                      Wallet error: {describeContractError(triggerWriteError, policyIdInput)}
+                    </p>
+                  )}
+
+                  {triggerReceipt?.status === 'reverted' && (
+                    <div className="text-[11px] text-red-700 bg-red-50 border border-red-200 rounded-lg p-2.5 text-center font-semibold">
+                      Mined but reverted on-chain. Policy #{policyIdInput} was NOT triggered.
+                      {triggerHash && (
                         <>
-                          <div className="w-1.5 h-1.5 rounded-full bg-[#2E7D32]"></div>
-                          <span className="text-xs font-bold text-[#2E7D32] uppercase">Verified</span>
-                        </>
-                      ) : (
-                        <>
-                          <div className="w-1.5 h-1.5 rounded-full bg-red-600"></div>
-                          <span className="text-xs font-bold text-red-600 uppercase">Revocation Triggered</span>
+                          {' '}
+                          <a href={`${EXPLORER_TX_BASE}/${triggerHash}`} target="_blank" rel="noreferrer" className="underline">
+                            View on explorer
+                          </a>
                         </>
                       )}
                     </div>
-                  </div>
-                  <button onClick={toggleBorrowerCvi} className={isCviVerified ? "bg-red-650 hover:bg-red-750 text-white font-bold text-xs py-2 px-3 rounded shadow-sm cursor-pointer" : "bg-green-700 hover:bg-green-800 text-white font-bold text-xs py-2 px-3 rounded shadow-sm cursor-pointer"}>
-                    {isCviVerified ? 'Revoke Borrower Credential' : 'Restore Borrower CVI'}
+                  )}
+
+                  <button
+                    type="button"
+                    onClick={() => setPipelineStep(1)}
+                    className="w-full text-xs font-bold text-slate-400 hover:text-slate-600 py-1 transition-colors"
+                  >
+                    ← Back to Step 1
                   </button>
                 </div>
+              )}
+
+              {pipelineStep === 3 && (
+                <div className="bg-white rounded-2xl border border-[#C8E6C9] shadow-sm p-8 space-y-5 animate-fade-in text-center">
+                  <div className="flex justify-center">
+                    <div className="p-4 bg-[#E8F5E9] border border-[#C8E6C9] rounded-full text-[#2E7D32]">
+                      <span className="material-symbols-outlined text-3xl">task_alt</span>
+                    </div>
+                  </div>
+                  <div>
+                    <span className="text-xs font-bold uppercase tracking-wider text-[#2E7D32]">Step 3 of 3 — Complete</span>
+                    <h3 className="text-xl font-bold text-primary-dark mt-1">Payout Triggered On-Chain</h3>
+                    <p className="text-sm text-tertiary-dark mt-1">
+                      Policy #{policyIdInput} resolved successfully and the receipt confirmed on Monad Testnet.
+                    </p>
+                  </div>
+
+                  <div className="bg-surface-container-low border border-outline-variant rounded-xl p-4 space-y-2.5 text-xs text-left">
+                    {mintHash && (
+                      <div className="flex justify-between items-center gap-3">
+                        <span className="text-tertiary-dark font-semibold shrink-0">Mint Tx</span>
+                        <a href={`${EXPLORER_TX_BASE}/${mintHash}`} target="_blank" rel="noreferrer" className="font-mono font-semibold text-purple-700 hover:text-purple-900 underline underline-offset-2 truncate">
+                          {truncateHash(mintHash)}
+                        </a>
+                      </div>
+                    )}
+                    {triggerHash && (
+                      <div className="flex justify-between items-center gap-3">
+                        <span className="text-tertiary-dark font-semibold shrink-0">Trigger Tx</span>
+                        <a href={`${EXPLORER_TX_BASE}/${triggerHash}`} target="_blank" rel="noreferrer" className="font-mono font-semibold text-purple-700 hover:text-purple-900 underline underline-offset-2 truncate">
+                          {truncateHash(triggerHash)}
+                        </a>
+                      </div>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={handleResetDemo}
+                    className="w-full bg-primary-dark hover:bg-slate-800 text-white font-bold text-sm py-3 rounded-xl shadow-sm flex items-center justify-center gap-2 transition-all duration-300 cursor-pointer"
+                  >
+                    <span className="material-symbols-outlined text-base">restart_alt</span>
+                    Run Demo Again
+                  </button>
+                </div>
+              )}
+            </div>
+
+            {/* Optional narrative add-ons — cosmetic, off-chain, kept separate
+                from the real pipeline above so judges never confuse the two. */}
+            <div className="max-w-xl mx-auto bg-slate-50/70 border border-slate-200 rounded-xl p-5 space-y-4">
+              <div>
+                <h4 className="text-xs font-bold uppercase tracking-wider text-slate-400">Optional — Narrative Layer (off-chain, cosmetic)</h4>
+                <p className="text-[11px] text-slate-400 mt-0.5">Purely local UI state for storytelling — doesn't touch the chain.</p>
               </div>
 
-              <div className="bg-white p-4 rounded-lg border border-purple-100 space-y-4">
-                <h3 className="font-bold text-primary-dark text-sm">2. Claims Payout & Expiry Trigger</h3>
-                <div className="space-y-2">
-                  <button
-                    disabled={policyStatus !== 'ACTIVE'}
-                    onClick={triggerPayoutSim}
-                    className={policyStatus === 'ACTIVE' ? "w-full bg-red-600 hover:bg-red-700 text-white font-bold text-xs py-2.5 rounded shadow-sm flex items-center justify-center gap-1 transition-colors cursor-pointer" : "w-full bg-slate-300 text-slate-500 font-bold text-xs py-2.5 rounded cursor-not-allowed flex items-center justify-center gap-1"}
-                  >
-                    <span className="material-symbols-outlined text-sm">notifications_active</span> Trigger Oracle Payout (Policy #0042)
-                  </button>
-                  <button
-                    disabled={policyStatus !== 'ACTIVE'}
-                    onClick={triggerExpirySim}
-                    className={policyStatus === 'ACTIVE' ? "w-full bg-slate-700 hover:bg-slate-800 text-white font-bold text-xs py-2.5 rounded shadow-sm flex items-center justify-center gap-1 transition-colors cursor-pointer" : "w-full bg-slate-300 text-slate-500 font-bold text-xs py-2.5 rounded cursor-not-allowed flex items-center justify-center gap-1"}
-                  >
-                    <span className="material-symbols-outlined text-sm">schedule_send</span> Repay Loan & Expire Policy (#0042)
-                  </button>
+              <div className="flex items-center justify-between bg-white p-3.5 rounded-lg border border-slate-150">
+                <div>
+                  <span className="text-xs text-tertiary-dark uppercase font-semibold">Borrower Wallet (0x82...A91)</span>
+                  <div className="flex items-center gap-1 mt-1">
+                    {isCviVerified ? (
+                      <>
+                        <div className="w-1.5 h-1.5 rounded-full bg-[#2E7D32]"></div>
+                        <span className="text-xs font-bold text-[#2E7D32] uppercase">Verified</span>
+                      </>
+                    ) : (
+                      <>
+                        <div className="w-1.5 h-1.5 rounded-full bg-red-600"></div>
+                        <span className="text-xs font-bold text-red-600 uppercase">Revocation Triggered</span>
+                      </>
+                    )}
+                  </div>
                 </div>
+                <button onClick={toggleBorrowerCvi} className={isCviVerified ? "bg-red-650 hover:bg-red-750 text-white font-bold text-xs py-2 px-3 rounded-lg shadow-sm cursor-pointer transition-colors" : "bg-green-700 hover:bg-green-800 text-white font-bold text-xs py-2 px-3 rounded-lg shadow-sm cursor-pointer transition-colors"}>
+                  {isCviVerified ? 'Revoke Borrower Credential' : 'Restore Borrower CVI'}
+                </button>
               </div>
+
+              <button
+                disabled={policyStatus !== 'ACTIVE'}
+                onClick={triggerExpirySim}
+                className={policyStatus === 'ACTIVE' ? "w-full bg-white border border-slate-200 hover:bg-slate-50 text-slate-700 font-bold text-xs py-2.5 rounded-lg shadow-sm flex items-center justify-center gap-1 transition-colors cursor-pointer" : "w-full bg-slate-100 text-slate-400 font-bold text-xs py-2.5 rounded-lg cursor-not-allowed flex items-center justify-center gap-1"}
+              >
+                <span className="material-symbols-outlined text-sm">schedule_send</span> Repay Loan &amp; Expire Policy (demo only, off-chain)
+              </button>
             </div>
           </div>
         )}
@@ -915,5 +1465,50 @@ export default function Home() {
         </div>
       )}
     </>
+  );
+}
+
+// Small stepper dot used by the Sandbox pipeline header. Kept local to this
+// file since it's only ever used here.
+function StepDot({
+  step,
+  label,
+  isActive,
+  isComplete,
+  isUnlocked,
+  onClick,
+}: {
+  step: number;
+  label: string;
+  isActive: boolean;
+  isComplete: boolean;
+  isUnlocked: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      disabled={!isUnlocked}
+      onClick={onClick}
+      className={`flex flex-col items-center gap-2 group ${isUnlocked ? 'cursor-pointer' : 'cursor-not-allowed'}`}
+    >
+      <div
+        className={[
+          'w-10 h-10 rounded-full flex items-center justify-center font-bold text-sm border-2 transition-all duration-300',
+          isComplete
+            ? 'bg-[#2E7D32] border-[#2E7D32] text-white'
+            : isActive
+              ? 'bg-purple-600 border-purple-600 text-white shadow-lg shadow-purple-200 scale-110'
+              : isUnlocked
+                ? 'bg-white border-purple-300 text-purple-600 group-hover:border-purple-500'
+                : 'bg-slate-100 border-slate-200 text-slate-400',
+        ].join(' ')}
+      >
+        {isComplete ? <span className="material-symbols-outlined text-lg">check</span> : step}
+      </div>
+      <span className={`text-[11px] font-bold uppercase tracking-wide transition-colors duration-300 ${isActive ? 'text-purple-700' : isComplete ? 'text-[#2E7D32]' : 'text-slate-400'}`}>
+        {label}
+      </span>
+    </button>
   );
 }
