@@ -74,7 +74,7 @@ contract InsurancePool {
             sharesMinted = (amount * totalShares) / _reserves;
         }
 
-        cvaToken.transferFrom(msg.sender, address(this), amount);
+        require(cvaToken.transferFrom(msg.sender, address(this), amount), "TransferFailed");
         
         totalShares += sharesMinted;
         positions[msg.sender].sharesOwned += sharesMinted;
@@ -107,7 +107,7 @@ contract InsurancePool {
         totalShares -= shares;
         positions[msg.sender].sharesOwned -= shares;
 
-        cvaToken.transfer(msg.sender, amountReturned);
+        require(cvaToken.transfer(msg.sender, amountReturned), "TransferFailed");
         emit UnderwritingWithdrawn(msg.sender, shares, amountReturned);
     }
 
@@ -121,7 +121,7 @@ contract InsurancePool {
     }
 
     function receivePremium(address payer, uint256 amount, uint256 policyId) external onlyPolicyManager {
-        cvaToken.transferFrom(payer, address(this), amount);
+        require(cvaToken.transferFrom(payer, address(this), amount), "TransferFailed");
         emit PremiumReceived(policyId, payer, amount);
     }
 
@@ -138,7 +138,7 @@ contract InsurancePool {
 
     function payout(uint256 policyId, address recipient, uint256 amount) external onlyPolicyManager {
         totalCommittedLiability -= amount;
-        cvaToken.transfer(recipient, amount);
+        require(cvaToken.transfer(recipient, amount), "TransferFailed");
         emit PayoutExecuted(policyId, recipient, amount);
     }
 }
